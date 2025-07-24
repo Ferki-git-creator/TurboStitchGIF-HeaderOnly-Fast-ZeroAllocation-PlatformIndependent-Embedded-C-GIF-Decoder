@@ -8,7 +8,6 @@
  *
  * @author Ferki
  * @date 16.07.2025
- * @version 0.3
  */
 
 #ifndef GIF_H
@@ -324,13 +323,14 @@ static void gif_report_error(GIF_Context *ctx, int error_code, const char* messa
 
 /**
  * @brief Reads a 16-bit unsigned integer in little-endian byte order.
+ * This function is endianness-agnostic.
  * @param data Pointer to the data.
  * @return The 16-bit unsigned integer.
  */
 static inline uint16_t gif_read_u16_le(const uint8_t *data) {
-    uint16_t value;
-    memcpy(&value, data, 2);
-    return value;
+    // Read bytes individually to ensure correct little-endian interpretation
+    // regardless of system endianness.
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
 }
 
 /**
@@ -404,8 +404,9 @@ static void gif_read_graphic_control_ext(GIF_Context *ctx) {
     rdit = gif_read_byte_internal(ctx);
     ctx->disposal_method = (rdit >> 2) & 3;
     ctx->has_transparency = rdit & 1;
-    ctx->frame_delay_ms = gif_read_u16_le(ctx->gif_data + ctx->current_pos) * 10;
+    ctx->frame_delay_ms = gif_read_u16_le(ctx->gif_data + ctx->current_pos); // Use fixed gif_read_u16_le
     gif_skip_bytes_internal(ctx, 2); // Delay time
+    ctx->frame_delay_ms *= 10; // Convert to ms from 1/100ths of a second
     ctx->transparent_index = gif_read_byte_internal(ctx);
     gif_skip_bytes_internal(ctx, 1); // Block terminator
 }
@@ -429,7 +430,7 @@ static void gif_read_application_ext(GIF_Context *ctx) {
             return;
         }
         gif_skip_bytes_internal(ctx, 1); // Sub-block ID (always 1)
-        ctx->loop_count = gif_read_u16_le(ctx->gif_data + ctx->current_pos);
+        ctx->loop_count = gif_read_u16_le(ctx->gif_data + ctx->current_pos); // Use fixed gif_read_u16_le
         gif_skip_bytes_internal(ctx, 2); // Loop count
     }
     gif_discard_sub_blocks(ctx); // Discard remaining sub-blocks for this extension
@@ -474,7 +475,7 @@ static int gif_get_more_lzw_data(GIF_Context *ctx) {
     // Shift remaining data to the beginning of the buffer
     if (ctx->lzw_read_offset > 0) {
         if (bytes_in_buffer > 0) {
-            memmove(ctx->scratch_lzw_buffer, ctx->scratch_lzw_buffer + ctx->lzw_read_offset, bytes_in_buffer);
+            memmove(ctx->scratch_lzw_buffer, ctx->scratch_lzw_buffer + ctx->lzw_read_offset, (size_t)bytes_in_buffer);
         }
         ctx->lzw_data_size = bytes_in_buffer;
         ctx->lzw_read_offset = 0;
@@ -535,7 +536,7 @@ static int gif_lzw_copy_bytes(uint8_t *buf, int offset, uint32_t *symbols, uint1
         if (offset + len > GIF_LZW_BASE_BUF_SIZE + GIF_LZW_TABLE_ENTRIES * 2) {
             return 0; // Indicate failure
         }
-        *symbols = offset;
+        *symbols = (uint32_t)offset;
         *d = (uint8_t)(u32Offset >> 24);
         *lengths = (uint16_t)len;
     }
@@ -562,7 +563,15 @@ static int gif_lzw_copy_bytes(uint8_t *buf, int offset, uint32_t *symbols, uint1
                 break; \
             } \
             p = ctx->scratch_lzw_buffer + ctx->lzw_read_offset; \
-            memcpy(&ulBits, p, sizeof(uint32_t)); /* Read 4 bytes for ulBits */ \
+            /* Ensure we don't read past end of buffer when copying ulBits */ \
+            if ((size_t)(ctx->lzw_read_offset + sizeof(uint32_t)) > (size_t)ctx->lzw_data_size) { \
+                /* Copy only available bytes and zero out the rest */ \
+                size_t bytes_avail = (size_t)ctx->lzw_data_size - (size_t)ctx->lzw_read_offset; \
+                ulBits = 0; /* Initialize to zero */ \
+                if (bytes_avail > 0) memcpy(&ulBits, p, bytes_avail); \
+            } else { \
+                memcpy(&ulBits, p, sizeof(uint32_t)); /* Read 4 bytes for ulBits */ \
+            } \
         } \
         code = (uint16_t)((ulBits >> bitnum) & sMask); \
         bitnum += codesize; \
@@ -605,14 +614,22 @@ static int gif_decode_lzw(GIF_Context *restrict ctx, uint8_t *restrict frame_buf
     }
 
     p = ctx->scratch_lzw_buffer;
-    memcpy(&ulBits, p, sizeof(uint32_t));
+    // Safely copy initial 4 bytes for ulBits, handling potential buffer end
+    if ((size_t)(ctx->lzw_read_offset + sizeof(uint32_t)) > (size_t)ctx->lzw_data_size) {
+        size_t bytes_avail = (size_t)ctx->lzw_data_size - (size_t)ctx->lzw_read_offset;
+        ulBits = 0;
+        if (bytes_avail > 0) memcpy(&ulBits, p, bytes_avail);
+    } else {
+        memcpy(&ulBits, p, sizeof(uint32_t));
+    }
+
 
     clear_code = 1 << ctx->lzw_code_start_size;
     eoi_code = clear_code + 1;
 
 #ifdef GIF_MODE_TURBO
     for (i = 0; i < clear_code; i++) {
-        lzw_symbols[i] = (uint32_t)(ctx->scratch_lzw_pixels_suffix - ctx->scratch_lzw_buffer) + i;
+        lzw_symbols[i] = (uint32_t)(ctx->scratch_lzw_pixels_suffix - ctx->scratch_lzw_buffer) + (uint32_t)i;
         lzw_lengths[i] = 1;
         lzw_pixels_suffix[i] = (uint8_t)i;
     }
@@ -626,6 +643,9 @@ init_codetable_turbo:
     GET_LZW_CODE(ctx, p, bitnum, codesize, sMask, code, ulBits);
     if (code == clear_code) {
         GET_LZW_CODE(ctx, p, bitnum, codesize, sMask, code, ulBits);
+    }
+    if (code == eoi_code) { // Handle immediate EOI after clear code
+        return GIF_SUCCESS;
     }
     if (code >= GIF_LZW_TABLE_ENTRIES || lzw_lengths[code] == 0) {
         gif_report_error(ctx, GIF_ERROR_DECODE, "Invalid initial LZW code in Turbo mode.");
@@ -641,75 +661,78 @@ init_codetable_turbo:
         if (code == clear_code) {
             goto init_codetable_turbo;
         }
-        if (code != eoi_code) {
-            int len_copied;
-            if (nextcode < GIF_LZW_TABLE_ENTRIES) {
-                if (code != nextcode) {
-                    len_copied = gif_lzw_copy_bytes(ctx->scratch_lzw_buffer, current_pixel_idx, &lzw_symbols[code], &lzw_lengths[code]);
-                    if (len_copied == 0) { gif_report_error(ctx, GIF_ERROR_DECODE, "LZW copy failed (buffer overflow)."); return GIF_ERROR_DECODE; }
-                    lzw_symbols[nextcode] = (lzw_symbols[oldcode] | 0x800000 | (ctx->scratch_lzw_buffer[current_pixel_idx] << 24));
-                    lzw_lengths[nextcode] = lzw_lengths[oldcode];
-                    current_pixel_idx += len_copied;
-                } else {
-                    len_copied = gif_lzw_copy_bytes(ctx->scratch_lzw_buffer, current_pixel_idx, &lzw_symbols[oldcode], &lzw_lengths[oldcode]);
-                    if (len_copied == 0) { gif_report_error(ctx, GIF_ERROR_DECODE, "LZW copy failed (buffer overflow)."); return GIF_ERROR_DECODE; }
-                    lzw_lengths[nextcode] = (uint16_t)(len_copied + 1);
-                    lzw_symbols[nextcode] = (uint32_t)current_pixel_idx;
-                    c = ctx->scratch_lzw_buffer[current_pixel_idx];
-                    current_pixel_idx += len_copied;
-                    ctx->scratch_lzw_buffer[current_pixel_idx++] = c;
-                }
-            } else {
-                 if (code >= GIF_LZW_TABLE_ENTRIES || lzw_lengths[code] == 0) {
-                     gif_report_error(ctx, GIF_ERROR_DECODE, "LZW dictionary full, but invalid code encountered in Turbo mode.");
-                     return GIF_ERROR_DECODE;
-                 }
+        // Check if code is valid before attempting to use it
+        if (code >= GIF_LZW_TABLE_ENTRIES) {
+             gif_report_error(ctx, GIF_ERROR_DECODE, "LZW code out of dictionary bounds.");
+             return GIF_ERROR_DECODE;
+        }
+
+        int len_copied;
+        if (nextcode < GIF_LZW_TABLE_ENTRIES) {
+            if (code != nextcode) {
                 len_copied = gif_lzw_copy_bytes(ctx->scratch_lzw_buffer, current_pixel_idx, &lzw_symbols[code], &lzw_lengths[code]);
                 if (len_copied == 0) { gif_report_error(ctx, GIF_ERROR_DECODE, "LZW copy failed (buffer overflow)."); return GIF_ERROR_DECODE; }
+                lzw_symbols[nextcode] = (lzw_symbols[oldcode] | 0x800000 | ((uint32_t)ctx->scratch_lzw_buffer[current_pixel_idx] << 24));
+                lzw_lengths[nextcode] = lzw_lengths[oldcode];
                 current_pixel_idx += len_copied;
+            } else { // Handle K, K, K sequence
+                len_copied = gif_lzw_copy_bytes(ctx->scratch_lzw_buffer, current_pixel_idx, &lzw_symbols[oldcode], &lzw_lengths[oldcode]);
+                if (len_copied == 0) { gif_report_error(ctx, GIF_ERROR_DECODE, "LZW copy failed (buffer overflow)."); return GIF_ERROR_DECODE; }
+                lzw_lengths[nextcode] = (uint16_t)(len_copied + 1);
+                lzw_symbols[nextcode] = (uint32_t)current_pixel_idx;
+                c = ctx->scratch_lzw_buffer[current_pixel_idx];
+                current_pixel_idx += len_copied;
+                ctx->scratch_lzw_buffer[current_pixel_idx++] = c;
             }
-            nextcode++;
-            if (nextcode >= nextlim && codesize < GIF_MAX_CODE_SIZE) {
-                codesize++;
-                nextlim <<= 1;
-                sMask = (sMask << 1) | 1;
-            }
-
-            if (current_pixel_idx >= ctx->frame_width) {
-                int y_draw = current_line_idx;
-                if (ctx->ucGIFBits & 0x40) {
-                    y_draw = interlaced_line_offset[interlaced_pass] + current_line_idx * interlaced_line_stride[interlaced_pass];
-                    while (y_draw >= ctx->frame_height && interlaced_pass < 3) {
-                        interlaced_pass++;
-                        current_line_idx = 0;
-                        y_draw = interlaced_line_offset[interlaced_pass] + current_line_idx * interlaced_line_stride[interlaced_pass];
-                    }
-                    if (y_draw >= ctx->frame_height) {
-                        gif_report_error(ctx, GIF_ERROR_DECODE, "Interlaced GIF decoding error: line out of bounds.");
-                        return GIF_ERROR_DECODE;
-                    }
-                }
-
-                uint8_t *dest_row_start = frame_buffer + (ctx->frame_y_off + y_draw) * ctx->canvas_width * 3 + ctx->frame_x_off * 3;
-                uint8_t *src_pixels = ctx->scratch_line_buffer;
-                uint8_t *palette = ctx->active_palette_colors; // Cache palette pointer
-
-                for (i = 0; i < ctx->frame_width; i++) {
-                    uint8_t pixel_index = src_pixels[i];
-                    if (ctx->has_transparency && pixel_index == ctx->transparent_index) {
-                        if (ctx->disposal_method == 2) {
-                            memcpy(dest_row_start + i*3, palette + ctx->background_index*3, 3);
-                        }
-                    } else {
-                        memcpy(dest_row_start + i*3, palette + pixel_index*3, 3);
-                    }
-                }
-                current_pixel_idx = 0;
-                current_line_idx++;
-            }
-            oldcode = code;
-            GET_LZW_CODE(ctx, p, bitnum, codesize, sMask, code, ulBits);
+        } else { // Dictionary full, but code is valid
+            len_copied = gif_lzw_copy_bytes(ctx->scratch_lzw_buffer, current_pixel_idx, &lzw_symbols[code], &lzw_lengths[code]);
+            if (len_copied == 0) { gif_report_error(ctx, GIF_ERROR_DECODE, "LZW copy failed (buffer overflow)."); return GIF_ERROR_DECODE; }
+            current_pixel_idx += len_copied;
         }
+        nextcode++;
+        if (nextcode >= nextlim && codesize < GIF_MAX_CODE_SIZE) {
+            codesize++;
+            nextlim <<= 1;
+            sMask = (sMask << 1) | 1;
+        }
+
+        // Render pixels to frame buffer as lines are completed
+        while (current_pixel_idx >= ctx->frame_width) {
+            int y_draw = current_line_idx;
+            if (ctx->ucGIFBits & 0x40) { // Interlaced
+                y_draw = interlaced_line_offset[interlaced_pass] + current_line_idx * interlaced_line_stride[interlaced_pass];
+                while (y_draw >= ctx->frame_height && interlaced_pass < 3) {
+                    interlaced_pass++;
+                    current_line_idx = 0;
+                    y_draw = interlaced_line_offset[interlaced_pass] + current_line_idx * interlaced_line_stride[interlaced_pass];
+                }
+                if (y_draw >= ctx->frame_height) {
+                    gif_report_error(ctx, GIF_ERROR_DECODE, "Interlaced GIF decoding error: line out of bounds.");
+                    return GIF_ERROR_DECODE;
+                }
+            }
+
+            uint8_t *dest_row_start = frame_buffer + (ctx->frame_y_off + y_draw) * ctx->canvas_width * 3 + ctx->frame_x_off * 3;
+            uint8_t *src_pixels = ctx->scratch_line_buffer;
+            uint8_t *palette = ctx->active_palette_colors; // Cache palette pointer
+
+            for (i = 0; i < ctx->frame_width; i++) {
+                uint8_t pixel_index = src_pixels[i];
+                if (ctx->has_transparency && pixel_index == ctx->transparent_index) {
+                    if (ctx->disposal_method == 2) {
+                        memcpy(dest_row_start + i*3, palette + ctx->background_index*3, 3);
+                    }
+                } else {
+                    memcpy(dest_row_start + i*3, palette + pixel_index*3, 3);
+                }
+            }
+            // Shift remaining pixels to the beginning of the scratch_line_buffer
+            memmove(ctx->scratch_line_buffer, ctx->scratch_line_buffer + ctx->frame_width, (size_t)(current_pixel_idx - ctx->frame_width));
+            current_pixel_idx -= ctx->frame_width;
+            current_line_idx++;
+        }
+        oldcode = code;
+        GET_LZW_CODE(ctx, p, bitnum, codesize, sMask, code, ulBits);
     }
 #else // GIF_MODE_SAFE
     for (i = 0; i < clear_code; i++) {
@@ -728,6 +751,9 @@ init_codetable_safe:
     if (code == clear_code) {
         GET_LZW_CODE(ctx, p, bitnum, codesize, sMask, code, ulBits);
     }
+    if (code == eoi_code) { // Handle immediate EOI after clear code
+        return GIF_SUCCESS;
+    }
     if (code >= GIF_LZW_TABLE_ENTRIES) {
         gif_report_error(ctx, GIF_ERROR_DECODE, "Invalid initial LZW code in Safe mode.");
         return GIF_ERROR_DECODE;
@@ -741,7 +767,7 @@ init_codetable_safe:
         temp_line_buf[--temp_idx] = lzw_pixels[current_lzw_code];
         current_lzw_code = lzw_table[current_lzw_code];
     }
-    memcpy(ctx->scratch_line_buffer, temp_line_buf + temp_idx, (size_t)(GIF_MAX_WIDTH - temp_idx));
+    memcpy(ctx->scratch_line_buffer + current_pixel_idx, temp_line_buf + temp_idx, (size_t)(GIF_MAX_WIDTH - temp_idx));
     current_pixel_idx += (GIF_MAX_WIDTH - temp_idx);
 
 
@@ -750,63 +776,70 @@ init_codetable_safe:
         if (code == clear_code) {
             goto init_codetable_safe;
         }
-        if (code != eoi_code) {
-            temp_idx = GIF_MAX_WIDTH;
-            current_lzw_code = code;
-            while(current_lzw_code != 0xFFFF && temp_idx > 0) {
-                temp_line_buf[--temp_idx] = lzw_pixels[current_lzw_code];
-                current_lzw_code = lzw_table[current_lzw_code];
-            }
-            int pixels_to_copy = GIF_MAX_WIDTH - temp_idx;
-            memcpy(ctx->scratch_line_buffer + current_pixel_idx, temp_line_buf + temp_idx, (size_t)pixels_to_copy);
-            current_pixel_idx += pixels_to_copy;
-
-            if (nextcode < GIF_LZW_TABLE_ENTRIES) {
-                lzw_table[nextcode] = oldcode;
-                lzw_pixels[nextcode] = c;
-                lzw_pixels[GIF_LZW_TABLE_ENTRIES + nextcode] = c = lzw_pixels[code];
-            }
-            nextcode++;
-            if (nextcode >= nextlim && codesize < GIF_MAX_CODE_SIZE) {
-                codesize++;
-                nextlim <<= 1;
-                sMask = nextlim - 1;
-            }
-
-            if (current_pixel_idx >= ctx->frame_width) {
-                int y_draw = current_line_idx;
-                if (ctx->ucGIFBits & 0x40) {
-                    y_draw = interlaced_line_offset[interlaced_pass] + current_line_idx * interlaced_line_stride[interlaced_pass];
-                    while (y_draw >= ctx->frame_height && interlaced_pass < 3) {
-                        interlaced_pass++;
-                        current_line_idx = 0;
-                        y_draw = interlaced_line_offset[interlaced_pass] + current_line_idx * interlaced_line_stride[interlaced_pass];
-                    }
-                    if (y_draw >= ctx->frame_height) {
-                        gif_report_error(ctx, GIF_ERROR_DECODE, "Interlaced GIF decoding error: line out of bounds.");
-                        return GIF_ERROR_DECODE;
-                    }
-                }
-
-                uint8_t *dest_row_start = frame_buffer + (ctx->frame_y_off + y_draw) * ctx->canvas_width * 3 + ctx->frame_x_off * 3;
-                uint8_t *src_pixels = ctx->scratch_line_buffer;
-                uint8_t *palette = ctx->active_palette_colors; // Cache palette pointer
-
-                for (i = 0; i < ctx->frame_width; i++) {
-                    uint8_t pixel_index = src_pixels[i];
-                    if (ctx->has_transparency && pixel_index == ctx->transparent_index) {
-                        if (ctx->disposal_method == 2) {
-                            memcpy(dest_row_start + i*3, palette + ctx->background_index*3, 3);
-                        }
-                    } else {
-                        memcpy(dest_row_start + i*3, palette + pixel_index*3, 3);
-                    }
-                }
-                current_pixel_idx = 0;
-                current_line_idx++;
-            }
-            oldcode = code;
+        // Check if code is valid before attempting to use it
+        if (code >= GIF_LZW_TABLE_ENTRIES) {
+             gif_report_error(ctx, GIF_ERROR_DECODE, "LZW code out of dictionary bounds.");
+             return GIF_ERROR_DECODE;
         }
+
+        temp_idx = GIF_MAX_WIDTH;
+        current_lzw_code = code;
+        while(current_lzw_code != 0xFFFF && temp_idx > 0) {
+            temp_line_buf[--temp_idx] = lzw_pixels[current_lzw_code];
+            current_lzw_code = lzw_table[current_lzw_code];
+        }
+        int pixels_to_copy = GIF_MAX_WIDTH - temp_idx;
+        memcpy(ctx->scratch_line_buffer + current_pixel_idx, temp_line_buf + temp_idx, (size_t)pixels_to_copy);
+        current_pixel_idx += pixels_to_copy;
+
+        if (nextcode < GIF_LZW_TABLE_ENTRIES) {
+            lzw_table[nextcode] = oldcode;
+            lzw_pixels[nextcode] = c;
+            lzw_pixels[GIF_LZW_TABLE_ENTRIES + nextcode] = c = lzw_pixels[code];
+        }
+        nextcode++;
+        if (nextcode >= nextlim && codesize < GIF_MAX_CODE_SIZE) {
+            codesize++;
+            nextlim <<= 1;
+            sMask = nextlim - 1;
+        }
+
+        // Render pixels to frame buffer as lines are completed
+        while (current_pixel_idx >= ctx->frame_width) {
+            int y_draw = current_line_idx;
+            if (ctx->ucGIFBits & 0x40) {
+                y_draw = interlaced_line_offset[interlaced_pass] + current_line_idx * interlaced_line_stride[interlaced_pass];
+                while (y_draw >= ctx->frame_height && interlaced_pass < 3) {
+                    interlaced_pass++;
+                    current_line_idx = 0;
+                    y_draw = interlaced_line_offset[interlaced_pass] + current_line_idx * interlaced_line_stride[interlaced_pass];
+                }
+                if (y_draw >= ctx->frame_height) {
+                    gif_report_error(ctx, GIF_ERROR_DECODE, "Interlaced GIF decoding error: line out of bounds.");
+                    return GIF_ERROR_DECODE;
+                }
+            }
+
+            uint8_t *dest_row_start = frame_buffer + (ctx->frame_y_off + y_draw) * ctx->canvas_width * 3 + ctx->frame_x_off * 3;
+            uint8_t *src_pixels = ctx->scratch_line_buffer;
+            uint8_t *palette = ctx->active_palette_colors; // Cache palette pointer
+
+            for (i = 0; i < ctx->frame_width; i++) {
+                uint8_t pixel_index = src_pixels[i];
+                if (ctx->has_transparency && pixel_index == ctx->transparent_index) {
+                    if (ctx->disposal_method == 2) {
+                        memcpy(dest_row_start + i*3, palette + ctx->background_index*3, 3);
+                    }
+                } else {
+                    memcpy(dest_row_start + i*3, palette + pixel_index*3, 3);
+                }
+            }
+            // Shift remaining pixels to the beginning of the scratch_line_buffer
+            memmove(ctx->scratch_line_buffer, ctx->scratch_line_buffer + ctx->frame_width, (size_t)(current_pixel_idx - ctx->frame_width));
+            current_pixel_idx -= ctx->frame_width;
+            current_line_idx++;
+        }
+        oldcode = code;
     }
 #endif // GIF_MODE_TURBO
 
@@ -874,7 +907,7 @@ int gif_init(GIF_Context *ctx, const uint8_t *data, size_t size, uint8_t *scratc
             gif_report_error(ctx, GIF_ERROR_UNSUPPORTED_COLOR_DEPTH, "Global Color Table size exceeds GIF_MAX_COLORS.");
             return GIF_ERROR_UNSUPPORTED_COLOR_DEPTH;
         }
-        if (gif_read_bytes_internal(ctx, ctx->global_palette_colors, gct_size * 3) < gct_size * 3) {
+        if (gif_read_bytes_internal(ctx, ctx->global_palette_colors, (size_t)gct_size * 3) < (size_t)gct_size * 3) {
             gif_report_error(ctx, GIF_ERROR_EARLY_EOF, "Early EOF while reading Global Color Table.");
             return GIF_ERROR_EARLY_EOF;
         }
@@ -961,7 +994,7 @@ int gif_next_frame(GIF_Context *ctx, uint8_t *frame_buffer, int *delay_ms) {
             gif_report_error(ctx, GIF_ERROR_UNSUPPORTED_COLOR_DEPTH, "Local Color Table size exceeds GIF_MAX_COLORS.");
             return -1;
         }
-        if (gif_read_bytes_internal(ctx, ctx->local_palette_colors, lct_size * 3) < lct_size * 3) {
+        if (gif_read_bytes_internal(ctx, ctx->local_palette_colors, (size_t)lct_size * 3) < (size_t)lct_size * 3) {
             gif_report_error(ctx, GIF_ERROR_EARLY_EOF, "Early EOF while reading Local Color Table.");
             return -1;
         }
